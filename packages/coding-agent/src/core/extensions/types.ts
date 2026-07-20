@@ -384,6 +384,14 @@ export interface ExtensionCommandContext extends ExtensionContext {
 
 	/** Reload extensions, skills, prompts, themes, and context files. */
 	reload(): Promise<void>;
+
+	/**
+	 * Manually continue from a failed (stopReason "error") or aborted ("aborted")
+	 * last assistant turn — lossless recovery after auto-retry exhaustion or Esc.
+	 * Mirrors auto-retry: pops the failed entry from runtime state (kept in the
+	 * session file) and re-runs the turn with the original input.
+	 */
+	resume(): Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }>;
 }
 
 /**
@@ -1683,6 +1691,7 @@ export interface ExtensionCommandContextActions {
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
+	resume: () => Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }>;
 }
 
 /**

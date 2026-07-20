@@ -1118,6 +1118,48 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Manually continue from a failed (stopReason "error") or aborted ("aborted")
+	 * last assistant turn. Mirrors the auto-retry continuation path: pops the
+	 * last assistant entry from agent state (kept in session for history), resets
+	 * the auto-retry counter, and re-enters the continuation loop. No backoff.
+	 *
+	 * Unlike auto-retry, this also accepts "aborted" (Esc) — auto-retry only
+	 * covers "error" (see packages/ai/src/utils/retry.ts:99).
+	 */
+	async resume(): Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }> {
+		if (!this.isIdle) return { resumed: false, reason: "not_idle" };
+		if (!this._hasFailedOrAbortedTail()) return { resumed: false, reason: "no_failed_turn" };
+		await this._runAgentContinue();
+		return { resumed: true };
+	}
+
+	private _hasFailedOrAbortedTail(): boolean {
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		return !!last && last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
+	}
+
+	private async _runAgentContinue(): Promise<void> {
+		// Mirror _prepareRetry pop (agent-session.ts:2643-2647): runtime state only,
+		// never sessionManager/leafId. The failed/aborted entry stays in the session
+		// file as the parent of whatever the continuation produces.
+		const messages = this.agent.state.messages;
+		this.agent.state.messages = messages.slice(0, -1);
+		this._retryAttempt = 0;
+		this._isAgentRunActive = true;
+		try {
+			await this.agent.continue();
+			while (await this._handlePostAgentRun()) {
+				await this.agent.continue();
+			}
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;

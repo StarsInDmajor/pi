@@ -1664,6 +1664,7 @@ export class InteractiveMode {
 				reload: async () => {
 					await this.handleReloadCommand();
 				},
+				resume: async () => this.session.resume(),
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;

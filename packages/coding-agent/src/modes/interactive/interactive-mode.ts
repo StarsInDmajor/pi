@@ -2813,6 +2813,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onAction("app.agent.continue", () => {
+			void this.handleContinueCommand();
+		});
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -2938,6 +2941,11 @@ export class InteractiveMode {
 			if (text === "/clone") {
 				this.editor.setText("");
 				await this.handleCloneCommand();
+				return;
+			}
+			if (text === "/continue") {
+				this.editor.setText("");
+				await this.handleContinueCommand();
 				return;
 			}
 			if (text === "/tree") {
@@ -5673,6 +5681,17 @@ export class InteractiveMode {
 	// =========================================================================
 	// Command handlers
 	// =========================================================================
+
+	private async handleContinueCommand(): Promise<void> {
+		const result = await this.session.resume();
+		if (!result.resumed) {
+			this.showStatus(
+				result.reason === "not_idle"
+					? "Agent is busy — press Esc first"
+					: "Nothing to continue (last turn did not fail)",
+			);
+		}
+	}
 
 	private async handleReloadCommand(): Promise<void> {
 		if (this.session.isStreaming) {

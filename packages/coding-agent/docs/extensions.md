@@ -1329,6 +1329,33 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
+### ctx.resume()
+
+Manually continue from a failed (`stopReason "error"`) or aborted (`"aborted"`) last assistant turn. This is lossless recovery after auto-retry exhaustion or an Esc abort — it mirrors the internal auto-retry continuation path: the failed entry is popped from runtime agent state (but kept in the session file for history) and the turn is re-run with the original input. No backoff is applied.
+
+Returns `{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }`. `reason` is set when `resumed` is `false`: `"not_idle"` if the agent is still streaming/retrying, `"no_failed_turn"` if the last message was not a failed or aborted assistant turn.
+
+```typescript
+pi.registerCommand("continue", {
+  description: "Re-run the last turn after a failed or aborted response",
+  handler: async (_args, ctx) => {
+    const result = await ctx.resume();
+    if (!result.resumed) {
+      ctx.ui.notify(
+        result.reason === "not_idle"
+          ? "Agent is busy — press Esc first"
+          : "Nothing to continue (last turn did not fail)",
+        "warning",
+      );
+    }
+  },
+});
+```
+
+Unlike auto-retry, `resume()` also accepts `stopReason "aborted"` (the Esc case), which auto-retry does not cover (see [`packages/ai/src/utils/retry.ts`](https://github.com/earendil-works/pi/blob/main/packages/ai/src/utils/retry.ts)). Manual resume does not consume the auto-retry budget — `retryAttempt` is reset to 0, so a subsequent transient error re-enters auto-retry from attempt 1.
+
+A built-in `/continue` command and `alt+r` shortcut (`app.agent.continue`) are provided out of the box; `ctx.resume()` is for extensions that want to trigger the same flow from their own commands or shortcuts.
+
 ## ExtensionAPI Methods
 
 ### pi.on(event, handler)

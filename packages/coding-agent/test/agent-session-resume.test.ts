@@ -76,6 +76,7 @@ describe("AgentSession resume", () => {
 		failStopReason?: "error" | "aborted";
 		failErrorMessage?: string;
 		streamDelayMs?: number;
+		baseDelayMs?: number;
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 0;
@@ -83,6 +84,7 @@ describe("AgentSession resume", () => {
 		const failStopReason = options?.failStopReason ?? "error";
 		const failErrorMessage = options?.failErrorMessage ?? "Connection error.";
 		const streamDelayMs = options?.streamDelayMs ?? 0;
+		const baseDelayMs = options?.baseDelayMs ?? 1;
 		let callCount = 0;
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -125,7 +127,7 @@ describe("AgentSession resume", () => {
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 		settingsManager.applyOverrides({
-			retry: { enabled: retryEnabled, maxRetries, baseDelayMs: 1 },
+			retry: { enabled: retryEnabled, maxRetries, baseDelayMs },
 		});
 
 		session = new AgentSession({
@@ -230,6 +232,48 @@ describe("AgentSession resume", () => {
 			(e) => e.type === "message" && (e.message as AssistantMessage).stopReason === "error",
 		);
 		expect(errorEntries.length).toBe(1);
+	});
+
+	it("keeps the failed tail when retry backoff is aborted (Esc), so resume() still works", async () => {
+		// Regression: _prepareRetry pops the failed assistant message BEFORE the
+		// backoff sleep. If Esc aborts the sleep ("Retry cancelled"), the pop was
+		// previously never undone — the tail became the user message and resume()
+		// reported "no_failed_turn" even though the turn never completed.
+		const created = await createSession({
+			failCount: 1,
+			retryEnabled: true,
+			maxRetries: 3,
+			baseDelayMs: 60_000, // long backoff so we can abort mid-sleep
+		});
+
+		// Wait deterministically for the backoff sleep to start.
+		const backoffStarted = new Promise<void>((resolve) => {
+			const unsub = created.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsub();
+					resolve();
+				}
+			});
+		});
+		const promptPromise = created.session.prompt("Test");
+		await backoffStarted;
+		expect(created.session.isRetrying).toBe(true);
+
+		// Esc during backoff → "Retry cancelled".
+		created.session.abortRetry();
+		await promptPromise;
+		expect(created.session.isIdle).toBe(true);
+
+		// The failed assistant message must still be the tail of agent state.
+		const messages = created.session.agent.state.messages;
+		const tail = messages[messages.length - 1] as AssistantMessage;
+		expect(tail.role).toBe("assistant");
+		expect(tail.stopReason).toBe("error");
+
+		// /continue must be able to pick it up.
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+		expect(created.getCallCount()).toBe(2);
 	});
 
 	it("leaves the session ready for a normal follow-up prompt", async () => {

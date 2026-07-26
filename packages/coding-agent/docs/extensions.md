@@ -1328,9 +1328,15 @@ export default function (pi: ExtensionAPI) {
 
 ### ctx.resume()
 
-Manually continue from a failed (`stopReason "error"`) or aborted (`"aborted"`) last assistant turn. This is lossless recovery after auto-retry exhaustion or an Esc abort — it mirrors the internal auto-retry continuation path: the failed entry is popped from runtime agent state (but kept in the session file for history) and the turn is re-run with the original input. No backoff is applied.
+Manually continue from an interrupted last turn. This is lossless recovery after auto-retry exhaustion, an Esc abort, or a process crash — it mirrors the internal auto-retry continuation path: failed entries are popped from runtime agent state (but kept in the session file for history) and the turn is re-run. No backoff is applied.
 
-Returns `{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }`. `reason` is set when `resumed` is `false`: `"not_idle"` if the agent is still streaming/retrying, `"no_failed_turn"` if the last message was not a failed or aborted assistant turn.
+Resumable tails:
+
+- Assistant turn with `stopReason "error"` or `"aborted"` — auto-retry exhaustion, Esc abort, or a cancelled retry backoff. Trailing non-LLM messages (e.g. flushed `!bash` output) are skipped when locating the failed turn.
+- User message — the process died mid-stream before the assistant reply was ever persisted (SIGKILL, OOM, power loss).
+- Assistant `stopReason "toolUse"` or a toolResult with earlier dangling tool calls — the process died during tool execution. Missing toolResults are synthesized as error results (and persisted) so providers never see a `tool_use` without a matching `tool_result`.
+
+Returns `{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }`. `reason` is set when `resumed` is `false`: `"not_idle"` if the agent is still streaming/retrying, `"no_failed_turn"` if the last turn completed normally.
 
 ```typescript
 pi.registerCommand("continue", {
@@ -1350,6 +1356,8 @@ pi.registerCommand("continue", {
 ```
 
 Unlike auto-retry, `resume()` also accepts `stopReason "aborted"` (the Esc case), which auto-retry does not cover (see [`packages/ai/src/utils/retry.ts`](https://github.com/earendil-works/pi/blob/main/packages/ai/src/utils/retry.ts)). Manual resume does not consume the auto-retry budget — `retryAttempt` is reset to 0, so a subsequent transient error re-enters auto-retry from attempt 1.
+
+One known limitation: synthesized toolResults are inserted mid-array in runtime state (directly after their `toolUse` assistant message, as providers require) but appended at the leaf in the append-only session file. If trailing `!bash` output was flushed between the two, a later session reload replays them in file order — a harmless ordering difference for all providers that tolerate non-adjacent `tool_result` blocks.
 
 A built-in `/continue` command and `alt+r` shortcut (`app.agent.continue`) are provided out of the box; `ctx.resume()` is for extensions that want to trigger the same flow from their own commands or shortcuts.
 

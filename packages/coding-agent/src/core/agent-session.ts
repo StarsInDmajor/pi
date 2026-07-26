@@ -2952,7 +2952,9 @@ export class AgentSession {
 
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
+		let poppedMessage: AgentMessage | undefined;
 		if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+			poppedMessage = messages[messages.length - 1];
 			this.agent.state.messages = messages.slice(0, -1);
 		}
 
@@ -2961,7 +2963,13 @@ export class AgentSession {
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
-			// Aborted during sleep - emit end event so UI can clean up
+			// Aborted during sleep - restore the failed tail so resume() (/continue)
+			// can still find it; otherwise the tail is the user message and resume
+			// reports "no_failed_turn" even though the turn never completed.
+			if (poppedMessage) {
+				this.agent.state.messages = [...this.agent.state.messages, poppedMessage];
+			}
+			// Emit end event so UI can clean up
 			const attempt = this._retryAttempt;
 			this._retryAttempt = 0;
 			this._emit({

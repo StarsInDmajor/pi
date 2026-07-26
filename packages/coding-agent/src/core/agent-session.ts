@@ -1088,6 +1088,9 @@ export class AgentSession {
 	 *   - user message — process died mid-stream before anything was persisted
 	 *   - assistant "toolUse" / toolResult with dangling tool calls — process died
 	 *     during tool execution; missing toolResults are synthesized as errors
+	 *   - empty completions (stopReason "stop"/"length" with neither text nor
+	 *     tool calls) — provider-side truncation returning thinking-only or
+	 *     fully empty responses; treated like failed turns
 	 */
 	async resume(): Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }> {
 		if (!this.isIdle) return { resumed: false, reason: "not_idle" };
@@ -1125,16 +1128,17 @@ export class AgentSession {
 	 *      reject outright.
 	 */
 	private _prepareResumableTail(): boolean {
-		// 1. Pop consecutive failed/aborted assistant tails. Normally the tail
-		// itself, but bashExecution messages flushed after a failed turn can push
-		// the failed assistant into the middle — splice by index either way.
+		// 1. Pop consecutive failed/aborted/empty assistant tails. Normally the
+		// tail itself, but bashExecution messages flushed after a failed turn can
+		// push the failed assistant into the middle — splice by index either way.
 		for (;;) {
 			const i = this._effectiveTailIndex();
 			if (i < 0) return false;
 			const msg = this.agent.state.messages[i];
 			if (msg.role === "assistant") {
-				const stopReason = (msg as AssistantMessage).stopReason;
-				if (stopReason === "error" || stopReason === "aborted") {
+				const assistant = msg as AssistantMessage;
+				const stopReason = assistant.stopReason;
+				if (stopReason === "error" || stopReason === "aborted" || this._isEmptyCompletion(assistant)) {
 					const messages = this.agent.state.messages;
 					this.agent.state.messages = [...messages.slice(0, i), ...messages.slice(i + 1)];
 					continue;
@@ -1168,6 +1172,20 @@ export class AgentSession {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * True for completions that protocol-completed but carry no usable payload:
+	 * stopReason "stop"/"length" with neither text nor tool calls (some
+	 * providers truncate server-side and return thinking-only or fully empty
+	 * responses with 0 output tokens). The user received nothing — treat the
+	 * turn as resumable.
+	 */
+	private _isEmptyCompletion(message: AssistantMessage): boolean {
+		if (message.stopReason !== "stop" && message.stopReason !== "length") return false;
+		return !message.content.some(
+			(block) => (block.type === "text" && block.text.trim().length > 0) || block.type === "toolCall",
+		);
 	}
 
 	/**

@@ -434,6 +434,41 @@ describe("AgentSession resume", () => {
 		expect(result).toEqual({ resumed: false, reason: "no_failed_turn" });
 	});
 
+	it("resumes from an empty thinking-only stop tail (provider truncation)", async () => {
+		// Some providers cut the completion server-side and return a "stop"
+		// response with thinking content but no text and 0 output tokens. The
+		// user sees nothing — the turn is degenerate and must be re-runnable.
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Setup");
+
+		const emptyStop = createAssistantMessage("", {
+			stopReason: "stop",
+			content: [{ type: "thinking", thinking: "Let me consider...", thinkingSignature: "sig" }],
+		});
+		created.session.agent.state.messages = [
+			...created.session.agent.state.messages,
+			{ role: "user", content: [{ type: "text", text: "Unanswered" }], timestamp: Date.now() },
+			emptyStop,
+		];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+		expect(created.getCallCount()).toBe(2);
+
+		// Empty completion popped; new reply is the tail.
+		const state = created.session.agent.state.messages;
+		expect(state.some((m) => m === emptyStop)).toBe(false);
+		expect((state.at(-1) as AssistantMessage).stopReason).toBe("stop");
+		expect(((state.at(-1) as AssistantMessage).content[0] as { text: string }).text).toBe("Success after resume");
+	});
+
+	it("still refuses a stop tail that has real text", async () => {
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Test"); // completes with visible text
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: false, reason: "no_failed_turn" });
+	});
+
 	it("leaves the session ready for a normal follow-up prompt", async () => {
 		// After resume() succeeds, the agent must be idle with retryAttempt reset,
 		// so a subsequent prompt works without "Agent is already processing" errors.

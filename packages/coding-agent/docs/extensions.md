@@ -1338,6 +1338,7 @@ Resumable tails:
 - Assistant turn with `stopReason "error"` or `"aborted"` — auto-retry exhaustion, Esc abort, or a cancelled retry backoff. Trailing non-LLM messages (e.g. flushed `!bash` output) are skipped when locating the failed turn.
 - User message — the process died mid-stream before the assistant reply was ever persisted (SIGKILL, OOM, power loss).
 - Assistant `stopReason "toolUse"` or a toolResult with earlier dangling tool calls — the process died during tool execution. Missing toolResults are synthesized as error results (and persisted) so providers never see a `tool_use` without a matching `tool_result`.
+- Empty completions (`stopReason "stop"`/`"length"` with neither text nor tool calls) — provider-side truncation that returns thinking-only or fully empty responses. Treated like failed turns and re-run.
 
 Returns `{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }`. `reason` is set when `resumed` is `false`: `"not_idle"` if the agent is still streaming/retrying, `"no_failed_turn"` if the last turn completed normally.
 

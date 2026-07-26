@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	EventStream,
+	getModel,
+} from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -274,6 +279,159 @@ describe("AgentSession resume", () => {
 		const result = await created.session.resume();
 		expect(result).toEqual({ resumed: true });
 		expect(created.getCallCount()).toBe(2);
+	});
+
+	it("resumes from a user-message tail (process killed mid-stream)", async () => {
+		// Crash window: the turn's assistant message was never persisted, so the
+		// reloaded session ends with the user message. resume() must re-run it.
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Setup"); // healthy completed turn
+		expect(created.getCallCount()).toBe(1);
+
+		// Simulate post-crash reload: tail is an unanswered user message.
+		created.session.agent.state.messages = [
+			...created.session.agent.state.messages,
+			{ role: "user", content: [{ type: "text", text: "Unanswered" }], timestamp: Date.now() },
+		];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+		expect(created.getCallCount()).toBe(2);
+
+		const tail = created.session.agent.state.messages.at(-1) as AssistantMessage;
+		expect(tail.role).toBe("assistant");
+		expect(tail.stopReason).toBe("stop");
+	});
+
+	it("resumes from a toolUse tail by synthesizing missing toolResults (killed during tools)", async () => {
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Setup");
+
+		// Simulate post-crash reload: assistant asked for two parallel tool calls,
+		// process died before any tool result was recorded.
+		const toolUseMsg = createAssistantMessage("", {
+			stopReason: "toolUse",
+			content: [
+				{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+				{ type: "toolCall", id: "call_2", name: "read", arguments: { path: "x" } },
+			],
+		});
+		created.session.agent.state.messages = [...created.session.agent.state.messages, toolUseMsg];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+
+		// Two synthesized error toolResults, inserted directly after the toolUse
+		// assistant message so providers see valid tool_use/tool_result ordering.
+		const state = created.session.agent.state.messages;
+		const toolUseIdx = state.findIndex((m) => m === toolUseMsg);
+		const r1 = state[toolUseIdx + 1];
+		const r2 = state[toolUseIdx + 2];
+		expect(r1.role).toBe("toolResult");
+		expect(r2.role).toBe("toolResult");
+		expect((r1 as { toolCallId: string }).toolCallId).toBe("call_1");
+		expect((r2 as { toolCallId: string }).toolCallId).toBe("call_2");
+		expect((r1 as { isError: boolean }).isError).toBe(true);
+
+		// Synthesized results are persisted — a future reload must not replay
+		// dangling tool calls.
+		const entries = created.session.sessionManager.getEntries();
+		const persisted = entries.filter(
+			(e) => e.type === "message" && (e.message as { role: string }).role === "toolResult",
+		);
+		expect(persisted.length).toBe(2);
+
+		// The continuation itself ran to completion.
+		expect(created.getCallCount()).toBe(2);
+		const tail = state.at(-1) as AssistantMessage;
+		expect(tail.stopReason).toBe("stop");
+	});
+
+	it("resumes from a toolResult tail (killed between tool result and next LLM call)", async () => {
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Setup");
+
+		const toolUseMsg = createAssistantMessage("", {
+			stopReason: "toolUse",
+			content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: {} }],
+		});
+		created.session.agent.state.messages = [
+			...created.session.agent.state.messages,
+			toolUseMsg,
+			{
+				role: "toolResult",
+				toolCallId: "call_1",
+				toolName: "bash",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+		expect(created.getCallCount()).toBe(2);
+
+		// No dangling calls here — nothing should have been synthesized.
+		const synthesized = created.session.agent.state.messages.filter(
+			(m) => m.role === "toolResult" && (m as { isError: boolean }).isError,
+		);
+		expect(synthesized.length).toBe(0);
+	});
+
+	it("resumes a failed turn even when bash messages trail the failed tail", async () => {
+		// _flushPendingBashMessages runs in the finally of a failed turn, so a
+		// bashExecution message can sit AFTER the failed assistant message.
+		const created = await createSession({ failCount: 1, retryEnabled: false });
+		await created.session.prompt("Test");
+		expect(created.getCallCount()).toBe(1);
+
+		created.session.agent.state.messages = [
+			...created.session.agent.state.messages,
+			{
+				role: "bashExecution",
+				command: "ls",
+				output: "file.txt",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: true });
+		expect(created.getCallCount()).toBe(2);
+
+		// Error popped from the middle; bash message and new reply both present.
+		const state = created.session.agent.state.messages;
+		expect(state.some((m) => m.role === "bashExecution")).toBe(true);
+		expect(state.some((m) => m.role === "assistant" && (m as AssistantMessage).stopReason === "error")).toBe(
+			false,
+		);
+		expect((state.at(-1) as AssistantMessage).stopReason).toBe("stop");
+	});
+
+	it("still refuses when a completed turn is followed only by bash output", async () => {
+		// Healthy idle session: user ran `!ls` after the turn finished. The tail
+		// is bashExecution but the effective LLM tail is stopReason "stop".
+		const created = await createSession({ failCount: 0, retryEnabled: false });
+		await created.session.prompt("Test");
+		created.session.agent.state.messages = [
+			...created.session.agent.state.messages,
+			{
+				role: "bashExecution",
+				command: "ls",
+				output: "file.txt",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = await created.session.resume();
+		expect(result).toEqual({ resumed: false, reason: "no_failed_turn" });
 	});
 
 	it("leaves the session ready for a normal follow-up prompt", async () => {

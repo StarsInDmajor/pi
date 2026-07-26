@@ -32,6 +32,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -1075,33 +1076,172 @@ export class AgentSession {
 	}
 
 	/**
-	 * Manually continue from a failed (stopReason "error") or aborted ("aborted")
-	 * last assistant turn. Mirrors the auto-retry continuation path: pops the
-	 * last assistant entry from agent state (kept in session for history), resets
-	 * the auto-retry counter, and re-enters the continuation loop. No backoff.
+	 * Manually continue from an interrupted last turn. Mirrors the auto-retry
+	 * continuation path: failed entries are popped from runtime agent state (but
+	 * kept in the session file for history), the auto-retry counter is reset, and
+	 * the turn is re-run. No backoff.
 	 *
-	 * Unlike auto-retry, this also accepts "aborted" (Esc) — auto-retry only
-	 * covers "error" (see packages/ai/src/utils/retry.ts:99).
+	 * Resumable tails (see _prepareResumableTail for details):
+	 *   - assistant stopReason "error"/"aborted" — failed turn (unlike auto-retry,
+	 *     "aborted" is accepted; auto-retry only covers "error", see
+	 *     packages/ai/src/utils/retry.ts:99)
+	 *   - user message — process died mid-stream before anything was persisted
+	 *   - assistant "toolUse" / toolResult with dangling tool calls — process died
+	 *     during tool execution; missing toolResults are synthesized as errors
 	 */
 	async resume(): Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }> {
 		if (!this.isIdle) return { resumed: false, reason: "not_idle" };
-		if (!this._hasFailedOrAbortedTail()) return { resumed: false, reason: "no_failed_turn" };
+		if (!this._prepareResumableTail()) return { resumed: false, reason: "no_failed_turn" };
 		await this._runAgentContinue();
 		return { resumed: true };
 	}
 
-	private _hasFailedOrAbortedTail(): boolean {
+	/** Roles that never appear in LLM context and may trail the effective tail
+	 * (e.g. pending bash results flushed in the finally of a failed turn). */
+	private static readonly _NON_LLM_ROLES = new Set(["bashExecution", "custom"]);
+
+	/** Index of the effective LLM tail: last user/assistant/toolResult message, or -1. */
+	private _effectiveTailIndex(): number {
 		const messages = this.agent.state.messages;
-		const last = messages[messages.length - 1];
-		return !!last && last.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted");
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (!AgentSession._NON_LLM_ROLES.has(messages[i].role)) return i;
+		}
+		return -1;
+	}
+
+	/**
+	 * Inspect the tail of agent state and, if it represents an interrupted turn,
+	 * mutate runtime state so agent.continue() can run. Returns false when the
+	 * last turn completed normally (nothing to resume).
+	 *
+	 * Mutations (runtime state only, except synthesized toolResults):
+	 *   1. Pop failed/aborted assistant messages. They stay in the session file
+	 *      as the parent of whatever the continuation produces (same contract as
+	 *      the auto-retry pop in _prepareRetry).
+	 *   2. Synthesize error toolResults for dangling tool calls in the unfinished
+	 *      trailing turn (process died during tool execution). These ARE appended
+	 *      to the session file — without them every future reload would replay a
+	 *      context whose tool_use blocks have no tool_result, which providers
+	 *      reject outright.
+	 */
+	private _prepareResumableTail(): boolean {
+		// 1. Pop consecutive failed/aborted assistant tails. Normally the tail
+		// itself, but bashExecution messages flushed after a failed turn can push
+		// the failed assistant into the middle — splice by index either way.
+		for (;;) {
+			const i = this._effectiveTailIndex();
+			if (i < 0) return false;
+			const msg = this.agent.state.messages[i];
+			if (msg.role === "assistant") {
+				const stopReason = (msg as AssistantMessage).stopReason;
+				if (stopReason === "error" || stopReason === "aborted") {
+					const messages = this.agent.state.messages;
+					this.agent.state.messages = [...messages.slice(0, i), ...messages.slice(i + 1)];
+					continue;
+				}
+			}
+			break;
+		}
+
+		const tailIndex = this._effectiveTailIndex();
+		if (tailIndex < 0) return false;
+		const tail = this.agent.state.messages[tailIndex];
+
+		// 2. Classify the effective tail.
+		if (tail.role === "user") {
+			// Process died (or retry backoff was aborted) before the assistant
+			// message was ever produced. Nothing to repair.
+			return true;
+		}
+		if (tail.role === "toolResult") {
+			// Died after a tool result but before the next assistant message.
+			// Earlier parallel tool calls may still be dangling.
+			this._repairDanglingToolCalls();
+			return true;
+		}
+		if (tail.role === "assistant") {
+			const assistant = tail as AssistantMessage;
+			if (assistant.stopReason !== "toolUse") return false; // completed turn
+			// Died before/during tool execution — none of the trailing turn's tool
+			// calls have results yet.
+			this._repairDanglingToolCalls();
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Synthesize error toolResults for tool calls in the trailing unfinished turn
+	 * (everything after the last user message) that have no matching toolResult.
+	 * Each synthesized result is inserted into runtime state directly after its
+	 * assistant message (providers require tool_result to follow tool_use) and
+	 * appended to the session file for persistence.
+	 */
+	private _repairDanglingToolCalls(): void {
+		const messages = this.agent.state.messages;
+
+		// Trailing turn = everything after the last user message.
+		let turnStart = 0;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === "user") {
+				turnStart = i + 1;
+				break;
+			}
+		}
+
+		const resolvedIds = new Set<string>();
+		for (let i = turnStart; i < messages.length; i++) {
+			const msg = messages[i];
+			if (msg.role === "toolResult") resolvedIds.add((msg as ToolResultMessage).toolCallId);
+		}
+
+		// Collect in message order so inserted results stay deterministic.
+		const dangling: Array<{ assistantIndex: number; id: string; name: string }> = [];
+		for (let i = turnStart; i < messages.length; i++) {
+			const msg = messages[i];
+			if (msg.role !== "assistant") continue;
+			for (const block of (msg as AssistantMessage).content) {
+				if (block.type === "toolCall" && !resolvedIds.has(block.id)) {
+					dangling.push({ assistantIndex: i, id: block.id, name: block.name });
+				}
+			}
+		}
+		if (dangling.length === 0) return;
+
+		// Insert after the owning assistant message, back to front so earlier
+		// indices stay valid. Multiple calls from one assistant message keep
+		// their original relative order.
+		for (let d = dangling.length - 1; d >= 0; d--) {
+			const { assistantIndex, id, name } = dangling[d];
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: id,
+				toolName: name,
+				content: [
+					{
+						type: "text",
+						text: "Tool execution did not complete: the agent process was interrupted before a result was recorded.",
+					},
+				],
+				isError: true,
+				timestamp: Date.now(),
+			};
+			const current = this.agent.state.messages;
+			this.agent.state.messages = [
+				...current.slice(0, assistantIndex + 1),
+				toolResult,
+				...current.slice(assistantIndex + 1),
+			];
+			// Persist (append-only session file; entry lands at the leaf even
+			// though runtime state has it mid-array — see _prepareResumableTail).
+			this.sessionManager.appendMessage(toolResult);
+		}
 	}
 
 	private async _runAgentContinue(): Promise<void> {
-		// Mirror _prepareRetry pop (agent-session.ts:2643-2647): runtime state only,
-		// never sessionManager/leafId. The failed/aborted entry stays in the session
+		// Tail preparation (popping failed entries, repairing dangling tool calls)
+		// happens in _prepareResumableTail. Popped entries stay in the session
 		// file as the parent of whatever the continuation produces.
-		const messages = this.agent.state.messages;
-		this.agent.state.messages = messages.slice(0, -1);
 		this._retryAttempt = 0;
 		this._isAgentRunActive = true;
 		try {

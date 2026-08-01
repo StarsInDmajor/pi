@@ -96,7 +96,7 @@ describe("AgentSession resume", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
-			streamFunction: () => {
+			streamFn: () => {
 				callCount++;
 				const stream = new MockAssistantStream();
 				const emit = () => {
@@ -107,9 +107,9 @@ describe("AgentSession resume", () => {
 						});
 						stream.push({ type: "start", partial: msg });
 						stream.push({
-							type: failStopReason === "aborted" ? "done" : "error",
+							type: "error",
 							reason: failStopReason,
-							...(failStopReason === "aborted" ? { message: msg } : { error: msg }),
+							error: msg,
 						});
 					} else {
 						const msg = createAssistantMessage("Success after resume");

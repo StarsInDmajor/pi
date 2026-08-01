@@ -425,7 +425,7 @@ export class ExtensionRunner {
 			this.navigateTreeHandler = actions.navigateTree;
 			this.switchSessionHandler = actions.switchSession;
 			this.reloadHandler = actions.reload;
-			this.resumeHandler = actions.resume;
+			this.resumeHandler = actions.resume ?? (async () => ({ resumed: false, reason: "no_failed_turn" }));
 			return;
 		}
 

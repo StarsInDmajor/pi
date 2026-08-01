@@ -1691,7 +1691,7 @@ export interface ExtensionCommandContextActions {
 		options?: { withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	) => Promise<{ cancelled: boolean }>;
 	reload: () => Promise<void>;
-	resume: () => Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }>;
+	resume?: () => Promise<{ resumed: boolean; reason?: "not_idle" | "no_failed_turn" }>;
 }
 
 /**

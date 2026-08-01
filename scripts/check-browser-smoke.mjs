@@ -8,7 +8,7 @@ const agentTreeshakeOutputPath = join(tmpdir(), "pi-agent-treeshake-smoke.js");
 const errorLogPath = join(tmpdir(), "pi-browser-smoke-errors.log");
 const generatedCatalogDataDir = join(process.cwd(), "packages/ai/src/providers/data");
 
-// Fresh checkouts do not materialize provider JSON until npm run build.
+// Fresh checkouts do not materialize provider JSON until model data is hydrated.
 const generatedCatalogDataPlugin = {
 	name: "generated-model-catalog",
 	setup(build) {
@@ -72,6 +72,22 @@ try {
 		if (includedInput) {
 			throw new Error(`Agent selective-provider bundle unexpectedly includes ${includedInput}`);
 		}
+	}
+
+	const contributingInputs = new Set(
+		Object.values(agentTreeshakeBuild.metafile.outputs).flatMap((output) =>
+			Object.entries(output.inputs)
+				.filter(([, contribution]) => contribution.bytesInOutput > 0)
+				.map(([input]) => input),
+		),
+	);
+	const catalogInputs = Array.from(contributingInputs).filter((input) =>
+		normalizePath(input).includes("packages/ai/src/providers/data/"),
+	);
+	if (catalogInputs.length !== 1 || !normalizePath(catalogInputs[0]).endsWith("/anthropic.json")) {
+		throw new Error(
+			`Agent selective-provider bundle catalogs: expected only anthropic.json, found ${catalogInputs.join(", ") || "none"}`,
+		);
 	}
 
 	const aiSdkPackages = [

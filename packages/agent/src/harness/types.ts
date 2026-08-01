@@ -2,12 +2,22 @@ import type {
 	ImageContent,
 	Model,
 	Models,
+	RetryPolicy,
 	SimpleStreamOptions,
 	TextContent,
 	Transport,
 	Usage,
 } from "@earendil-works/pi-ai";
-import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.ts";
+import type { Static, TSchema } from "typebox";
+import type {
+	AgentEvent,
+	AgentMessage,
+	AgentTool,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	QueueMode,
+	ThinkingLevel,
+} from "../index.ts";
 import type { Session } from "./session/session.ts";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
@@ -84,6 +94,27 @@ export interface AgentHarnessResources<
 	/** Skills available to the model and explicit skill invocation. */
 	skills?: TSkill[];
 }
+
+/** Tool definition executed by an {@link AgentHarness} with an application-defined context. */
+export type AgentHarnessTool<
+	TContext extends object | undefined,
+	TParameters extends TSchema = TSchema,
+	TDetails = unknown,
+> = Omit<AgentTool<TParameters, TDetails>, "execute"> & {
+	/** Execute the tool call with the context resolved for the current turn snapshot. */
+	execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+		context: TContext,
+	): Promise<AgentToolResult<TDetails>>;
+};
+
+/** Static tool context or zero-argument provider resolved for each turn snapshot. */
+export type AgentHarnessToolContextSource<TContext extends object | undefined> =
+	| TContext
+	| (() => TContext | Promise<TContext>);
 
 /** Curated provider request options owned by the harness and snapshotted per turn. */
 export interface AgentHarnessStreamOptions {
@@ -313,8 +344,10 @@ export interface FileSystem {
 export interface ShellExecOptions {
 	/** Working directory for the command. Relative paths are resolved against {@link ExecutionEnv.cwd}. Defaults to {@link ExecutionEnv.cwd}. */
 	cwd?: string;
-	/** Additional environment variables for the command. Values override the environment defaults. Defaults to no overrides. */
+	/** Environment variables for the command. Values override inherited defaults when `inheritEnv` is true. */
 	env?: Record<string, string>;
+	/** Whether to inherit the execution environment's default variables. Defaults to true. */
+	inheritEnv?: boolean;
 	/** Timeout in seconds. Implementations should return a timeout error when the command exceeds this duration. Defaults to no timeout. */
 	timeout?: number;
 	/** Abort signal used to terminate the command. Defaults to no abort signal. */
@@ -370,8 +403,9 @@ export interface ActiveToolsChangeEntry extends SessionTreeEntryBase {
 export interface CompactionEntry<T = unknown> extends SessionTreeEntryBase {
 	type: "compaction";
 	summary: string;
-	firstKeptEntryId: string;
+	firstKeptEntryId?: string;
 	tokensBefore: number;
+	retainedTail?: AgentMessage[];
 	details?: T;
 	usage?: Usage;
 	fromHook?: boolean;
@@ -436,6 +470,14 @@ export interface SessionContext {
 	activeToolNames: string[] | null;
 }
 
+export interface SessionStats {
+	messageCount: number;
+	cachedTokens: number;
+	uncachedTokens: number;
+	totalTokens: number;
+	costTotal: number;
+}
+
 export interface SessionMetadata {
 	id: string;
 	createdAt: string;
@@ -448,20 +490,10 @@ export interface JsonlSessionMetadata extends SessionMetadata {
 	metadata?: Record<string, unknown>;
 }
 
-export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetadata> {
-	getMetadata(): Promise<TMetadata>;
-	getLeafId(): Promise<string | null>;
-	/** Persist a leaf entry that records the active session-tree leaf. */
-	setLeafId(leafId: string | null): Promise<void>;
-	createEntryId(): Promise<string>;
-	appendEntry(entry: SessionTreeEntry): Promise<void>;
-	getEntry(id: string): Promise<SessionTreeEntry | undefined>;
-	findEntries<TType extends SessionTreeEntry["type"]>(
-		type: TType,
-	): Promise<Array<Extract<SessionTreeEntry, { type: TType }>>>;
-	getLabel(id: string): Promise<string | undefined>;
-	getPathToRoot(leafId: string | null): Promise<SessionTreeEntry[]>;
-	getEntries(): Promise<SessionTreeEntry[]>;
+export interface SessionEntryCursorOptions {
+	/** Number of entries already consumed; reading starts at this zero-based sequence. */
+	afterEntrySeq?: number;
+	limit?: number;
 }
 
 export type { Session } from "./session/session.ts";
@@ -470,22 +502,64 @@ export interface SessionCreateOptions {
 	id?: string;
 }
 
+export interface SessionSearchOptions {
+	text: string;
+	cwd?: string;
+}
+
+export interface SessionSearchHit<TMetadata extends SessionMetadata = SessionMetadata> {
+	metadata: TMetadata;
+	entryId: string;
+	timestamp: string;
+	snippet?: string;
+	score?: number;
+}
+
+/** Owns session search queries. */
+export interface SessionSearch<TMetadata extends SessionMetadata = SessionMetadata> {
+	search(options: SessionSearchOptions): Promise<SessionSearchHit<TMetadata>[]>;
+}
+
 export interface SessionForkOptions {
 	entryId?: string;
 	position?: "before" | "at";
 	id?: string;
 }
 
-export interface SessionRepo<
+export type SessionForkSelection =
+	/** Copy all persisted entries in append order. */
+	| { kind: "all" }
+	/** Copy the target's active path, excluding the target; the target must be a user message. */
+	| { kind: "before_user_message"; entryId: string }
+	/** Copy the target's active path, including the target. */
+	| { kind: "through_entry"; entryId: string };
+
+export interface SessionHead {
+	leafId: string | null;
+}
+
+/** Canonical reads for one stored session. Its lifetime is owned by the containing {@link SessionStore}. */
+export interface SessionReader<TMetadata extends SessionMetadata = SessionMetadata> {
+	readonly metadata: TMetadata;
+	/** Rejects with `invalid_session` when a non-null active leaf does not reference a stored entry. */
+	readHead(): Promise<SessionHead>;
+	readEntry(id: string): Promise<SessionTreeEntry | undefined>;
+	readEntries(options?: SessionEntryCursorOptions): Promise<readonly SessionTreeEntry[]>;
+	readPathToRootOrCompaction(leafId: string | null): Promise<readonly SessionTreeEntry[]>;
+}
+
+/** Owns persistence and resources shared by all sessions in a repository. */
+export interface SessionStore<
 	TMetadata extends SessionMetadata = SessionMetadata,
 	TCreateOptions extends SessionCreateOptions = SessionCreateOptions,
 	TListOptions = void,
-> {
-	create(options: TCreateOptions): Promise<Session<TMetadata>>;
-	open(metadata: TMetadata): Promise<Session<TMetadata>>;
+> extends AsyncDisposable {
+	create(options: TCreateOptions): Promise<SessionReader<TMetadata>>;
+	load(metadata: TMetadata): Promise<SessionReader<TMetadata>>;
 	list(options?: TListOptions): Promise<TMetadata[]>;
+	appendEntry(metadata: TMetadata, entry: SessionTreeEntry): Promise<void>;
 	delete(metadata: TMetadata): Promise<void>;
-	fork(source: TMetadata, options: SessionForkOptions & TCreateOptions): Promise<Session<TMetadata>>;
+	fork(source: TMetadata, options: TCreateOptions, selection: SessionForkSelection): Promise<SessionReader<TMetadata>>;
 }
 
 export interface JsonlSessionCreateOptions extends SessionCreateOptions {
@@ -497,9 +571,6 @@ export interface JsonlSessionCreateOptions extends SessionCreateOptions {
 export interface JsonlSessionListOptions {
 	cwd?: string;
 }
-
-export interface JsonlSessionRepoApi
-	extends SessionRepo<JsonlSessionMetadata, JsonlSessionCreateOptions, JsonlSessionListOptions> {}
 
 export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
 
@@ -613,6 +684,25 @@ export interface SessionTreeEvent {
 	fromHook?: boolean;
 }
 
+export interface RetryScheduledEvent {
+	type: "retry_scheduled";
+	operation: "compaction" | "branch_summary";
+	attempt: number;
+	maxAttempts: number;
+	delayMs: number;
+	errorMessage: string;
+}
+
+export interface RetryAttemptStartEvent {
+	type: "retry_attempt_start";
+	operation: "compaction" | "branch_summary";
+}
+
+export interface RetryFinishedEvent {
+	type: "retry_finished";
+	operation: "compaction" | "branch_summary";
+}
+
 export interface ModelUpdateEvent {
 	type: "model_update";
 	model: Model<any>;
@@ -663,6 +753,9 @@ export type AgentHarnessOwnEvent<
 	| SessionCompactEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent
+	| RetryScheduledEvent
+	| RetryAttemptStartEvent
+	| RetryFinishedEvent
 	| ModelUpdateEvent
 	| ThinkingLevelUpdateEvent
 	| ResourcesUpdateEvent<TSkill, TPromptTemplate>
@@ -732,6 +825,9 @@ export type AgentHarnessEventResultMap = {
 	session_compact: undefined;
 	session_before_tree: SessionBeforeTreeResult | undefined;
 	session_tree: undefined;
+	retry_scheduled: undefined;
+	retry_attempt_start: undefined;
+	retry_finished: undefined;
 	model_update: undefined;
 	thinking_level_update: undefined;
 	resources_update: undefined;
@@ -753,10 +849,11 @@ export interface AbortResult {
 
 export interface CompactResult {
 	summary: string;
-	firstKeptEntryId: string;
+	firstKeptEntryId?: string;
 	tokensBefore: number;
 	/** Usage from the LLM call(s) that generated this summary, if available. */
 	usage?: Usage;
+	retainedTail?: AgentMessage[];
 	details?: unknown;
 }
 
@@ -776,6 +873,7 @@ export interface CompactionPreparation {
 	firstKeptEntryId: string;
 	messagesToSummarize: AgentMessage[];
 	turnPrefixMessages: AgentMessage[];
+	retainedTail: AgentMessage[];
 	isSplitTurn: boolean;
 	tokensBefore: number;
 	previousSummary?: string;
@@ -817,12 +915,27 @@ export interface BranchSummaryResult {
 	modifiedFiles: string[];
 }
 
-export interface AgentHarnessOptions<
+export type AgentHarnessSystemPrompt<
+	TContext extends object | undefined = undefined,
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
-	TTool extends AgentTool = AgentTool,
+	TTool extends AgentHarnessTool<TContext> = AgentHarnessTool<TContext>,
+> =
+	| string
+	| ((context: {
+			session: Session;
+			model: Model<any>;
+			thinkingLevel: ThinkingLevel;
+			activeTools: TTool[];
+			resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	  }) => string | Promise<string>);
+
+interface AgentHarnessOptionsBase<
+	TContext extends object | undefined,
+	TSkill extends Skill,
+	TPromptTemplate extends PromptTemplate,
+	TTool extends AgentHarnessTool<TContext>,
 > {
-	env: ExecutionEnv;
 	session: Session;
 	/**
 	 * Provider collection used for all model requests (turn streaming,
@@ -836,23 +949,32 @@ export interface AgentHarnessOptions<
 	 * Applications own loading/reloading resources and should call `setResources()` with new values.
 	 */
 	resources?: AgentHarnessResources<TSkill, TPromptTemplate>;
-	systemPrompt?:
-		| string
-		| ((context: {
-				env: ExecutionEnv;
-				session: Session;
-				model: Model<any>;
-				thinkingLevel: ThinkingLevel;
-				activeTools: TTool[];
-				resources: AgentHarnessResources<TSkill, TPromptTemplate>;
-		  }) => string | Promise<string>);
+	systemPrompt?: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool>;
 	/** Curated stream/provider request options. Snapshotted at turn start. */
 	streamOptions?: AgentHarnessStreamOptions;
+	/** Optional retry policy for generated compaction and branch-summary requests. */
+	retry?: RetryPolicy;
 	model: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	activeToolNames?: string[];
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 }
+
+export type AgentHarnessOptions<
+	TContext extends object | undefined = undefined,
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentHarnessTool<TContext> = AgentHarnessTool<TContext>,
+> = AgentHarnessOptionsBase<TContext, TSkill, TPromptTemplate, TTool> &
+	([TContext] extends [undefined]
+		? {
+				/** Context-free harnesses do not need a tool context. */
+				toolContext?: undefined;
+			}
+		: {
+				/** Static context or zero-argument context provider resolved for each turn snapshot. */
+				toolContext: AgentHarnessToolContextSource<TContext>;
+			});
 
 export type { AgentHarness } from "./agent-harness.ts";

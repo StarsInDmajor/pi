@@ -516,6 +516,20 @@ const IGNORED_COMMANDS = new Set([
 	"scriptstyle",
 	"scriptscriptstyle",
 	"textstyle",
+	// Legacy LaTeX 2.09 font switches (\rm, \bf, ...). This renderer outputs
+	// plain text without font styling, so they are no-ops — same net effect as
+	// the \mathrm-style PLAIN_WRAPPERS, but applied group-scoped without an
+	// argument. Common in real-world LaTeX that LLMs reproduce (F_{\rm obs}).
+	"rm",
+	"bf",
+	"it",
+	"sf",
+	"tt",
+	"sl",
+	"sc",
+	"em",
+	"cal",
+	"mit",
 ]);
 const SIZE_COMMANDS = new Set([
 	"big",

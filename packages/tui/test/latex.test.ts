@@ -483,6 +483,19 @@ R\left(\frac{\pi}{4}\right)
 		assert.strictEqual(renderLatex(String.raw`\tfrac{1}{2}`, { display: true }), "1/2");
 	});
 
+	it("treats legacy LaTeX 2.09 font switches as no-ops", () => {
+		assert.strictEqual(
+			renderLatex(String.raw`F_{\rm intrinsic}(\lambda) = \delta(\lambda-\lambda_0)`),
+			"F_intrinsic(λ) = δ(λ-λ₀)",
+		);
+		assert.strictEqual(
+			renderLatex(String.raw`F_{\rm obs}(\lambda) = F_{\rm intrinsic}(\lambda) \otimes K_{\rm instrument}(\lambda)`),
+			"F_obs(λ) = F_intrinsic(λ) ⊗ Kᵢₙₛₜᵣᵤₘₑₙₜ(λ)",
+		);
+		assert.strictEqual(renderLatex(String.raw`{\bf E} = mc^2`), "E = mc²");
+		assert.strictEqual(renderLatex(String.raw`x_{\it max} + y^{\cal C}`), "xₘₐₓ + y^C");
+	});
+
 	it("returns undefined for unsupported commands", () => {
 		assert.strictEqual(renderLatex(String.raw`x + \unknown{y}`), undefined);
 	});

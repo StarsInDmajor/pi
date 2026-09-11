@@ -1648,6 +1648,48 @@ bar`,
 			assert.ok(!rawPlain.join("").includes("(https://example.com)"), "URL should not appear inline in parentheses");
 		});
 
+		it("should resolve relative link hrefs to file:// URLs for OSC 8", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown("[report](analysis/outputs/report/index.html)", 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(80);
+			const joined = lines.join("");
+
+			// Relative href is resolved against cwd into an absolute file:// URI
+			const expected = `\x1b]8;;file://${process.cwd()}/analysis/outputs/report/index.html\x1b\\`;
+			assert.ok(joined.includes(expected), `Should contain resolved file:// OSC 8 target, got: ${JSON.stringify(joined)}`);
+			// Raw relative href must not appear as the OSC 8 target
+			assert.ok(
+				!joined.includes("\x1b]8;;analysis/outputs"),
+				"Should not emit the unresolved relative href as OSC 8 target",
+			);
+		});
+
+		it("should keep the fragment when resolving relative link hrefs", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown("[steps](docs/demo.html#next-steps)", 0, 0, defaultMarkdownTheme);
+
+			const joined = markdown.render(80).join("");
+			assert.ok(
+				joined.includes(`file://${process.cwd()}/docs/demo.html#next-steps`),
+				"Fragment should survive file:// resolution",
+			);
+		});
+
+		it("should wrap each line of a multi-line link in its own OSC 8 sequence", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown("[line one\nline two](https://example.com)", 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(80);
+			const hyperlinked = lines.filter((line) => line.includes("\x1b]8;;https://example.com"));
+			// Both rendered lines must carry the hyperlink; a single OSC 8 pair
+			// spanning a newline would leave the second line unlinked.
+			assert.strictEqual(hyperlinked.length, 2, `Expected 2 hyperlinked lines, got: ${JSON.stringify(lines)}`);
+			for (const line of hyperlinked) {
+				assert.ok(line.includes("\x1b]8;;\x1b\\"), "Each hyperlinked line must close its OSC 8 sequence");
+			}
+		});
+
 		it("should use OSC 8 for mailto links when terminal supports hyperlinks", () => {
 			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
 			const markdown = new Markdown("[Email me](mailto:test@example.com)", 0, 0, defaultMarkdownTheme);

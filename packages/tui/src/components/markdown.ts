@@ -1,6 +1,6 @@
 import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } from "marked";
 import { renderLatex } from "../latex.ts";
-import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
+import { getCapabilities, hyperlink, isImageLine, resolveLinkHref } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
@@ -692,7 +692,15 @@ export class Markdown implements Component {
 					if (getCapabilities().hyperlinks) {
 						// OSC 8: render as a clickable hyperlink. The URL is not printed inline,
 						// so we always show only the link text regardless of whether it matches href.
-						result += hyperlink(styledLink, token.href) + stylePrefix;
+						// Terminals only accept absolute URIs and reset OSC 8 state at line
+						// boundaries, so resolve relative hrefs against cwd and wrap each
+						// rendered line separately.
+						const resolvedHref = resolveLinkHref(token.href);
+						result +=
+							styledLink
+								.split("\n")
+								.map((line: string) => (line ? hyperlink(line, resolvedHref) : line))
+								.join("\n") + stylePrefix;
 					} else {
 						// Fallback: print URL in parentheses when text differs from href.
 						// Compare raw token.text (not styled) against href for the equality check.

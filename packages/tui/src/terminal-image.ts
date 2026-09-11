@@ -670,6 +670,27 @@ export function hyperlink(text: string, url: string): string {
 	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
 }
 
+/**
+ * Resolve a markdown link href to an absolute URI suitable for OSC 8.
+ *
+ * Terminals ignore OSC 8 targets without a scheme (a relative path like
+ * `docs/index.html` is not clickable), so convert relative hrefs to file://
+ * URLs resolved against `cwd`. Absolute paths get a file:// scheme; hrefs
+ * that already carry a scheme (https:, mailto:, ...) pass through unchanged.
+ */
+export function resolveLinkHref(href: string, cwd: string = process.cwd()): string {
+	if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
+		return href;
+	}
+	if (href.startsWith("#")) {
+		return href;
+	}
+	const [pathPart, ...rest] = href.split("#");
+	const fragment = rest.length > 0 ? `#${rest.join("#")}` : "";
+	const absolute = isAbsolute(pathPart) ? pathPart : `${cwd}/${pathPart}`;
+	return pathToFileURL(absolute).href + fragment;
+}
+
 /** Shorten home-prefixed absolute paths to ~/... for compact display. */
 function shortenImagePath(filename: string): string {
 	const home = homedir();
